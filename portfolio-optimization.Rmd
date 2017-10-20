@@ -1,0 +1,314 @@
+---
+title: "Portfolio optimization without leaving the tidyverse"
+author: "Davis Vaughan"
+date: "10/13/2017"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+---
+
+# Setup
+
+## Required packages
+
+```{r, message=FALSE, warning=FALSE}
+# For loading tidyverse and getting data
+library(tidyquant)
+
+# For portfolio optimization
+library(PortfolioAnalytics)
+
+# For purrr parallelization
+library(future)
+
+# Also used
+library(rmarkdown)
+
+# Set ggplot theme
+theme_set(theme_minimal())
+```
+
+## Get data for the Wealthfront ETFs
+
+```{r}
+wf_stocks <- tibble(
+  wf_ticker = c("VTI", "VEA", "VWO", "VNQ", "XLE", "BND", "SCHP", "VTEB", "VIG"),
+  wf_name   = c("US Stocks", "Foreign Stocks", "Emerging Markets", "Real Estate",
+                "Natural Resources", "US Gov Bonds", "TIPS", 
+                "Muni Bonds", "Dividend Stocks")
+)
+
+wf_stocks <- tq_get(wf_stocks, from = "2000-01-01")
+
+# Only select minimal columns
+wf_stocks_minimal <- wf_stocks %>%
+  select(wf_ticker, wf_name, date, adjusted)
+
+wf_stocks_minimal
+```
+
+# Exploration and visualization
+
+## Calculate returns with tidyquant
+
+```{r}
+# Using tq_mutate with a group_by to calculate returns for each stock in 
+# a tidy way
+wf_stocks_returns <- wf_stocks_minimal %>%
+  group_by(wf_ticker) %>%
+  tq_mutate(adjusted, dailyReturn, col_rename = "daily_return")
+
+wf_stocks_returns
+```
+
+## Time series of the returns
+
+Notice how muni bonds have a very short series.
+
+```{r}
+wf_stocks_returns %>%
+  ggplot(aes(x = date, y = daily_return)) +
+  geom_line() +
+  facet_wrap(~wf_name)
+```
+
+## Not a complete history for each ticker
+
+```{r}
+wf_stocks_returns %>%
+  summarise(min_date = min(date))
+```
+
+## Throw out VTEB so we at least have history since `2010-08-05`
+
+```{r}
+wf_stocks_returns <- wf_stocks_returns %>%
+  filter(wf_ticker != "VTEB")
+```
+
+## Now look at the density graphs
+
+Less volatile ETFs have a very narrow, highly peaked density
+
+```{r}
+wf_stocks_returns %>%
+  ggplot(aes(x = daily_return, fill = wf_name)) +
+  geom_density(alpha = .2) +
+  theme_minimal() +
+  coord_cartesian(xlim = c(-.05, .05))
+```
+
+# Portfolio optimization simple cases
+
+## Convert from long to wide
+
+- Also throw out any NA data 
+- And convert to data.frame only with dates as rownames (for PortfolioAnalytics)
+
+```{r}
+wf_wide_returns <- wf_stocks_returns %>%
+  ungroup() %>%
+  select(wf_name, date, daily_return) %>%
+  spread(wf_name, daily_return) %>%
+  as.data.frame() %>%
+  na.omit()
+
+rownames(wf_wide_returns) <- wf_wide_returns$date
+wf_wide_returns$date <- NULL
+
+head(wf_wide_returns)
+```
+
+## Create a portfolio spec for maximum return no leverage portfolio
+
+```{r}
+pspec <- portfolio.spec(assets = colnames(wf_wide_returns)) %>%
+  add.constraint(type = "box", min = 0.00, max = 1.00)
+
+pspec_max_return <- add.objective(pspec, type = "return", name = "mean")
+
+pspec_max_return
+```
+
+## Optimize this portfolio
+
+```{r}
+optim_max_return <- optimize.portfolio(R = wf_wide_returns, portfolio = pspec_max_return, optimize_method = "ROI", trace = TRUE)
+
+optim_max_return
+```
+
+# Portfolio optimization with purrr in parallel
+
+The whole idea will be to use a "multiple model" framework with purrr and
+list-columns.
+
+## Setup up efficient frontier tibble
+
+Set up N portfolio specs
+
+- Minimum variance
+- Target expected return varies from 0.0001 -> 0.0005764
+- "Max return" comes from the max return portfolio above
+
+```{r}
+# Change this to change the number of portfolios that get run
+# Increasing this increases the "density" of the frontier line
+# because you have more points filling in the gaps
+n_portfolios_in_frontier <- 1000
+
+# Vector of target returns for the frontier
+min_ret <- 0.0001
+max_ret <- optim_max_return$objective_measures$mean
+ret_vec <- seq(min_ret, max_ret, length.out = n_portfolios_in_frontier)
+
+frontier <- tibble(return_target = ret_vec)
+
+# A base portfolio spec. Additional constraint will be the return target
+# unique to each portfolio spec
+# This spec uses no leverage and minimizes variance
+base_portfolio_spec <- portfolio.spec(assets = colnames(wf_wide_returns)) %>%
+  add.constraint(type = "box", min = 0.00, max = 1.00) %>%
+  add.objective(type = "risk", name = "var")
+  
+# Function to add target return to the spec
+add_return_target_constraint <- function(ret) {
+  add.constraint(base_portfolio_spec, type = "return", 
+                 name = "mean", return_target = ret)
+}
+
+# Add a return target constraint to each base spec, and create a list
+# column out of them as a new column
+frontier <- mutate(frontier,
+                   portfolio_spec = map(.x = return_target, 
+                                        .f = add_return_target_constraint))
+
+frontier
+```
+
+## Slice up the frontier
+
+Slice up frontier into 4 smaller tibbles, each with 250 models to run. These
+will get distributed across the 4 cores on my machine.
+
+```{r}
+# Groups to divide up what models go to what core on my 4 core machine
+future_core <- rep(1:4, each = nrow(frontier) / 4)
+
+# Divide and nest
+frontier_divided <- frontier %>%
+  mutate(future_core = future_core) %>%
+  group_by(future_core) %>%
+  nest(.key = "divided_frontier")
+
+frontier_divided
+```
+
+## Helper functions for the parallel optimization
+
+1) `optimize_wf_portfolio` will optimize a given portfolio spec
+2) `map_optimize` will map the `optimize_wf_portfolio` function to each of the 250 portfolio specs in the sub-tibble
+
+```{r}
+optimize_wf_portfolio <- function(spec) {
+  optimize.portfolio(R = wf_wide_returns, portfolio = spec, optimize_method = "ROI")
+}
+
+map_optimize <- function(frontier_tbl) {
+  mutate(frontier_tbl, 
+         optimized_model = map(portfolio_spec, optimize_wf_portfolio))
+}
+```
+
+## Perform the parallel optimization
+
+Each optimized portfolio is returned and is added as an element in a new
+column in the `frontier` tibble.
+
+- Not in parallel, this takes around `113` seconds on my computer.
+- In parallel this takes around `38` seconds.
+- Both seem to run slightly faster when not using `Knit to HTML` and instead
+just running the code chunk by itself. I think future uses a different _plan_
+when you Knit, but not sure.
+
+```{r}
+# Start time
+t1 <- proc.time()
+
+# Tell the future package to use multiprocess
+# Picks multicore on Mac, multisession on Windows
+plan(multiprocess)
+
+# Send out the computation.
+# If running at home, notice how you instantly get control back
+# This is due to the future package
+frontier_divided <- frontier_divided %>%
+  mutate(divided_frontier = map(.x = divided_frontier,
+                                .f = ~future(map_optimize(.x))))
+
+# Ask for the results. "Locks up" R until the computations are complete
+frontier_divided <- frontier_divided %>%
+  mutate(divided_frontier = values(divided_frontier))
+
+# End time
+proc.time() - t1
+
+# Unnest and assign back to frontier
+frontier <- frontier_divided %>%
+  unnest() %>%
+  select(-future_core)
+
+frontier
+```
+
+# Post analysis
+
+## Model metrics
+
+Some initial models cannot hit the arbitrary low return target I had specified.
+
+```{r}
+# Calculate model metrics for each optimization
+frontier <- frontier %>%
+ mutate(weights       = map(.x = optimized_model,     .f = ~.x$weights),
+        actual_risk   = map_dbl(.x = optimized_model, .f = ~.x$objective_measures$StdDev),
+        actual_return = map_dbl(.x = weights,         .f = ~.x %*% colMeans(wf_wide_returns)),
+        actual_sharpe = actual_return / actual_risk)
+
+# Print as a paged data frame
+rmarkdown:::print.paged_df(frontier)
+```
+
+## A nice ggplot of the frontier
+
+Lighter color for higher sharpe ratio.
+
+```{r}
+ggplot(frontier, aes(x = actual_risk, y = actual_return, color = actual_sharpe)) +
+  geom_point() 
+```
+
+## Best portfolios as defined by max sharpe and return
+
+```{r}
+# "Best" as defined by max sharpe
+frontier %>%
+  filter(actual_sharpe == max(actual_sharpe, na.rm = TRUE)) %>%
+  summarise(annual_risk = actual_risk * sqrt(252),
+            annual_ret  = (actual_return + 1) ^ 252 - 1)
+  
+```
+
+```{r}
+# "Best" as defined by max return
+frontier %>%
+  filter(actual_return == max(actual_return, na.rm = TRUE)) %>%
+  summarise(annual_risk = actual_risk * sqrt(252),
+            annual_ret  = (actual_return + 1) ^ 252 - 1)
+```
+
+
+
